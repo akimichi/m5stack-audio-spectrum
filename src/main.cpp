@@ -23,6 +23,9 @@ constexpr float kBandHighHz = 8000.0f;  // 最高表示周波数 (= ナイキス
 constexpr float kMinDbfs = -75.0f;      // 表示下限 (dBFS)
 constexpr float kMaxDbfs = 0.0f;        // 表示上限 (dBFS)
 constexpr float kReleaseRate = 0.85f;   // バー減衰係数 (1フレームあたり)
+constexpr int   kPeakHoldFrames = 20;   // ピークを保持するフレーム数 (約1秒)
+constexpr float kPeakFallPerFrame = 0.01f;  // 保持期間後のピーク落下量 (高さ比/フレーム)
+constexpr int   kPeakMarkH = 2;         // ピークマーカーの太さ (px)
 
 constexpr int kScreenW = 320;
 constexpr int kScreenH = 240;
@@ -44,6 +47,8 @@ M5Canvas canvas(&M5.Display);
 // band_edges[i] .. band_edges[i+1]-1 がバンド i に属するビン番号
 uint16_t band_edges[kBandCount + 1];
 float    band_level[kBandCount];  // 0.0 .. 1.0 (減衰処理後)
+float    band_peak[kBandCount];   // ピークホールド値 0.0 .. 1.0
+int      band_peak_hold[kBandCount];  // 残り保持フレーム数
 
 // ---- 診断用 (シリアルに1秒ごとに出力) ----
 struct Diag {
@@ -105,6 +110,17 @@ void updateBandLevels() {
     // アタックは即時、リリースはゆっくり
     float decayed = band_level[b] * kReleaseRate;
     band_level[b] = (level > decayed) ? level : decayed;
+
+    // ピークホールド: 更新時は一定時間保持し、その後ゆっくり落下させる
+    if (band_level[b] >= band_peak[b]) {
+      band_peak[b] = band_level[b];
+      band_peak_hold[b] = kPeakHoldFrames;
+    } else if (band_peak_hold[b] > 0) {
+      --band_peak_hold[b];
+    } else {
+      band_peak[b] -= kPeakFallPerFrame;
+      if (band_peak[b] < band_level[b]) band_peak[b] = band_level[b];
+    }
   }
 }
 
@@ -177,13 +193,19 @@ void drawBars() {
     int x1 = kGraphX + static_cast<int>((b + 1) * band_w) - kBarGap;
     int w = x1 - x0;
     if (w < 1) w = 1;
-    int h = static_cast<int>(band_level[b] * kGraphH);
-    if (h <= 0) continue;
-    // 下から上へ色を変えながら積む
     const int y_bottom = kGraphY + kGraphH;
+    int h = static_cast<int>(band_level[b] * kGraphH);
+    // 下から上へ色を変えながら積む
     for (int y = 0; y < h; ++y) {
       float ratio = static_cast<float>(y) / kGraphH;
       canvas.drawFastHLine(x0, y_bottom - 1 - y, w, barColor(ratio));
+    }
+    // ピークマーカー (バー上端より上にある場合のみ描く)
+    int ph = static_cast<int>(band_peak[b] * kGraphH);
+    if (ph > h && ph > 0) {
+      int py = y_bottom - ph;
+      if (py < kGraphY) py = kGraphY;
+      canvas.fillRect(x0, py, w, kPeakMarkH, TFT_WHITE);
     }
   }
 }
@@ -218,6 +240,8 @@ void setup() {
 
   setupBandEdges();
   for (auto& l : band_level) l = 0.0f;
+  for (auto& p : band_peak) p = 0.0f;
+  for (auto& h : band_peak_hold) h = 0;
 
   // Core2 では内蔵マイク(I2S0, PDM CLK=GPIO0)とスピーカー(I2S1, WS=GPIO0)が GPIO0 を共有する。
   // スピーカーを確実に止めてからマイクを開始する。
