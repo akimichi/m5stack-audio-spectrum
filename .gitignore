@@ -69,3 +69,6 @@ Testing/
 
 # PlatformIO
 .pio/
+
+# Claude temporary files
+.claude/tmp/

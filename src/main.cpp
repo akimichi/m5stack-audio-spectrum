@@ -45,6 +45,17 @@ M5Canvas canvas(&M5.Display);
 uint16_t band_edges[kBandCount + 1];
 float    band_level[kBandCount];  // 0.0 .. 1.0 (減衰処理後)
 
+// ---- 診断用 (シリアルに1秒ごとに出力) ----
+struct Diag {
+  uint32_t frames = 0;        // FFT処理したフレーム数
+  uint32_t record_fail = 0;   // record() が false を返した回数
+  int16_t  min_sample = 0;
+  int16_t  max_sample = 0;
+  float    rms_dbfs = kMinDbfs;
+  float    peak_band_dbfs = kMinDbfs;
+  uint32_t last_print_ms = 0;
+} diag;
+
 // 対数周波数軸上の位置 (0.0 .. 1.0) を返す
 float logPosition(float hz) {
   return std::log(hz / kBandLowHz) / std::log(kBandHighHz / kBandLowHz);
@@ -79,12 +90,14 @@ uint16_t barColor(float ratio) {
 void updateBandLevels() {
   // Hamming窓 + N点FFT での正弦波フルスケール時のピーク値
   const float full_scale = 32768.0f * (kFftSize / 2.0f) * 0.54f;
+  diag.peak_band_dbfs = kMinDbfs;
   for (int b = 0; b < kBandCount; ++b) {
     float peak = 0.0f;
     for (int bin = band_edges[b]; bin < band_edges[b + 1]; ++bin) {
       if (vReal[bin] > peak) peak = vReal[bin];
     }
     float dbfs = (peak > 0.0f) ? 20.0f * std::log10(peak / full_scale) : kMinDbfs;
+    if (dbfs > diag.peak_band_dbfs) diag.peak_band_dbfs = dbfs;
     float level = (dbfs - kMinDbfs) / (kMaxDbfs - kMinDbfs);
     if (level < 0.0f) level = 0.0f;
     if (level > 1.0f) level = 1.0f;
@@ -95,6 +108,32 @@ void updateBandLevels() {
   }
 }
 
+// 時間波形の min / max / RMS(dBFS) を診断用に求める
+void updateWaveStats() {
+  int16_t mn = INT16_MAX, mx = INT16_MIN;
+  double sq = 0.0;
+  for (int i = 0; i < kFftSize; ++i) {
+    int16_t v = rec_buf[i];
+    if (v < mn) mn = v;
+    if (v > mx) mx = v;
+    sq += static_cast<double>(v) * v;
+  }
+  diag.min_sample = mn;
+  diag.max_sample = mx;
+  float rms = static_cast<float>(std::sqrt(sq / kFftSize));
+  diag.rms_dbfs = (rms > 0.0f) ? 20.0f * std::log10(rms / 32768.0f) : kMinDbfs;
+}
+
+void printDiag() {
+  uint32_t now = millis();
+  if (now - diag.last_print_ms < 1000) return;
+  diag.last_print_ms = now;
+  Serial.printf("frames=%lu rec_fail=%lu min=%d max=%d rms=%.1fdBFS peak_band=%.1fdBFS\n",
+                static_cast<unsigned long>(diag.frames),
+                static_cast<unsigned long>(diag.record_fail),
+                diag.min_sample, diag.max_sample, diag.rms_dbfs, diag.peak_band_dbfs);
+}
+
 void drawHeader() {
   canvas.setTextColor(TFT_WHITE, TFT_BLACK);
   canvas.setTextDatum(top_left);
@@ -102,10 +141,15 @@ void drawHeader() {
   canvas.setTextSize(1);
   canvas.drawString("Audio Spectrum", kGraphX, 4);
   char buf[48];
-  snprintf(buf, sizeof(buf), "%lu Hz / %u pt / %.1f Hz",
-           static_cast<unsigned long>(kSampleRate), kFftSize, kBinHz);
+  snprintf(buf, sizeof(buf), "%lu Hz / %u pt  RMS %.0f dB",
+           static_cast<unsigned long>(kSampleRate), kFftSize, diag.rms_dbfs);
   canvas.setTextDatum(top_right);
   canvas.drawString(buf, kScreenW - kGraphX, 4);
+  if (!M5.Imu.isEnabled()) {
+    canvas.setTextColor(TFT_RED, TFT_BLACK);
+    canvas.setTextDatum(top_center);
+    canvas.drawString("NO IMU: bottom (mic) not attached?", kScreenW / 2, kHeaderH + 4);
+  }
 }
 
 void drawFooter() {
@@ -159,6 +203,7 @@ void setup() {
   auto cfg = M5.config();
   cfg.internal_mic = true;
   M5.begin(cfg);
+  Serial.begin(115200);
 
   M5.Display.setRotation(1);
   M5.Display.setBrightness(128);
@@ -174,8 +219,18 @@ void setup() {
   setupBandEdges();
   for (auto& l : band_level) l = 0.0f;
 
-  // Core2 ではマイクとスピーカーが同じ I2S ポートを使うため、スピーカーを止めてからマイクを開始する
+  // Core2 では内蔵マイク(I2S0, PDM CLK=GPIO0)とスピーカー(I2S1, WS=GPIO0)が GPIO0 を共有する。
+  // スピーカーを確実に止めてからマイクを開始する。
+  // (スピーカー未起動時は "I2S port 1 has not installed" のログが出るが無害)
   M5.Speaker.end();
+
+  // Core2 のマイク(SPM1423)と IMU(MPU6886) は本体ではなくバッテリーボトム基板に載っており、
+  // M-BUS 経由 (GPIO0=CLK, GPIO34=DATA) で接続される。IMU が見つからなければボトム未装着の疑いが強い。
+  Serial.printf("IMU: %s (type=%d)\n", M5.Imu.isEnabled() ? "found" : "NOT found",
+                static_cast<int>(M5.Imu.getType()));
+  if (!M5.Imu.isEnabled()) {
+    Serial.println("WARNING: IMU not found. Is the battery bottom (with mic) attached?");
+  }
   auto mic_cfg = M5.Mic.config();
   mic_cfg.sample_rate = kSampleRate;
   M5.Mic.config(mic_cfg);
@@ -184,12 +239,22 @@ void setup() {
     M5.Display.drawString("Mic.begin failed", 4, 4);
     while (true) M5.delay(1000);
   }
+  mic_cfg = M5.Mic.config();
+  Serial.printf("Mic: data_in=%d ws=%d bck=%d port=%d rate=%lu oversample=%u mag=%u\n",
+                mic_cfg.pin_data_in, mic_cfg.pin_ws, mic_cfg.pin_bck,
+                static_cast<int>(mic_cfg.i2s_port),
+                static_cast<unsigned long>(mic_cfg.sample_rate),
+                mic_cfg.over_sampling, mic_cfg.magnification);
+
+  render();  // 録音前に枠だけ描いておく (黒画面との区別のため)
 }
 
 void loop() {
   M5.update();
 
   if (!M5.Mic.record(rec_buf, kFftSize, kSampleRate)) {
+    ++diag.record_fail;
+    printDiag();
     M5.delay(10);
     return;
   }
@@ -198,6 +263,7 @@ void loop() {
     M5.delay(1);
   }
 
+  updateWaveStats();
   for (int i = 0; i < kFftSize; ++i) {
     vReal[i] = static_cast<float>(rec_buf[i]);
     vImag[i] = 0.0f;
@@ -209,4 +275,6 @@ void loop() {
 
   updateBandLevels();
   render();
+  ++diag.frames;
+  printDiag();
 }
