@@ -200,12 +200,12 @@ void drawBars() {
       float ratio = static_cast<float>(y) / kGraphH;
       canvas.drawFastHLine(x0, y_bottom - 1 - y, w, barColor(ratio));
     }
-    // ピークマーカー (バー上端より上にある場合のみ描く)
+    // ピークマーカー (赤、バー上端より上にある場合のみ描く)
     int ph = static_cast<int>(band_peak[b] * kGraphH);
     if (ph > h && ph > 0) {
       int py = y_bottom - ph;
       if (py < kGraphY) py = kGraphY;
-      canvas.fillRect(x0, py, w, kPeakMarkH, TFT_WHITE);
+      canvas.fillRect(x0, py, w, kPeakMarkH, TFT_RED);
     }
   }
 }
